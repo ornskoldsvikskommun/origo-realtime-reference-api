@@ -12,6 +12,9 @@ const db = process.env.pgDatabase || 'gis';
 const user = process.env.pgUser || 'postgres';
 const password = process.env.pgPassword || 'postgres';
 
+/**
+ * Application name
+ */
 const APP_NAME = 'sse-server';
 
 /**
