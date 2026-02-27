@@ -46,7 +46,7 @@ async function subscribe(eventName, callback) {
     const subClient = await pool.connect();
     try {
         const res = await subClient.query(`LISTEN "${eventName}"`);
-        subClient.on('notification', (msg) => callback(msg));
+        subClient.on('notification', (msg) => callback(msg.payload));
 
     }
     finally {

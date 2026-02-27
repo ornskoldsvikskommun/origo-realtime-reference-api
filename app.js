@@ -1,10 +1,16 @@
 import express from 'express';
-import SSE from 'express-sse';
-import * as pgRepo from './dal/pgrepo.js';
 import cors from 'cors';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
 
-const app = express();
-const bindport = process.env.PORT || 3003;
+import * as pgRepo from './dal/pgrepo.js';
+import * as wsHandler from './routers/wsstream.js';
+import featureApiRouter from './routers/featureapi.js';
+import ConnectionManager from './utils/wsconnectionmanager.js';
+
+
+const bindport = process.env.PORT || 3004;
+const wsBase = process.env.WSBASE || `ws://localhost:${bindport}`;
 const virtualPath = process.env.virtualPath || '';
 const host = process.env.pgConnectString || 'localhost';
 const port = process.env.pgPort || '5432';
@@ -15,16 +21,30 @@ const password = process.env.pgPassword || 'postgres';
 /**
  * Application name
  */
-const APP_NAME = 'sse-server';
+const APP_NAME = 'origo-realtimereference-api';
+
+const app = express();
+const server = createServer(app);
+app.use((req,res,next) => {
+    res.set({
+      "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+      "Pragma": "no-cache",
+      "Expires": "0",
+      "Surrogate-Control": "no-store"
+    });
+    next();
+});
+app.set('etag', false);
 
 /**
  * Configuration for different layers
  * name: name as used in the query string to identify layer
  * table: database table to get initial state from. If not specified no initial state is sent
- * updateEventName: name of the Postgres notification event for updates
+ * initialAsEvents: if tru initial state is sent as events. Otherwise in the features API items endpoint. Requires 'table' setting.
+ * updateEventName: name of the Postgres notification event for updates. The event should emit a GeoJson feature for the updated/created feature
+ * deleteEventName: name of the Postgres notification event for deletes. The event should emit a feature id for the deleted feature
  * idField: field in the table to use as feature id. If not specified GeoJson id is
- * used if present (older Postgis versions < 3.5 do not include id in GeoJSON)
- * deleteEventName: name of the Postgres notification event for deletes
+ *          used if present (older Postgis versions < 3.5 do not include id in GeoJSON)
  * 
  * TODO: Move to config file
  */
@@ -34,7 +54,8 @@ const layers = [
     table: 'sf.linjelager',
     updateEventName: 'update_linjelager',
     idField: 'fid',
-    deleteEventName: 'delete_linjelager'
+    deleteEventName: 'delete_linjelager',
+    initialAsEvents: false
   },
   {
     name: 'punktlager',
@@ -46,9 +67,14 @@ const layers = [
 ];
 
 /**
- * SSE instances for each layer
+ * Options sent to feature api router
  */
-const sses = {}
+const featuresApiOpts = {
+  /** Features api must know where to point links to stream*/
+  streamBaseUrl: `${wsBase}${virtualPath}/streams`,
+  layers,
+  pgRepo
+}
 
 // Init repo
 try {
@@ -65,53 +91,27 @@ try {
 }
 
 /**
- * Helper to send updates
- * @param {*} featureStr 
- * @param {*} layer 
+ * The one and only websocket listener.
  */
-function sendUpdate(featureStr, layer) {
-  const feature = JSON.parse(featureStr);
-  if(layer.idField) {
-    // Add id (or override) as older Postgis does not add id
-    feature.id = feature.properties[layer.idField];
-  }
-  sses[layer.name].send(feature, 'update');
-}
+const wss = new WebSocketServer({ 
+    clientTracking: true,
+    server,
+    path: virtualPath + '/streams'
+});
 
-/**
- * Callback for db notifications
- * @param {*} layer 
- * @param {*} msg 
- */
-function updateCallback(layer, msg) {
-  console.log(msg);
-  sendUpdate(msg.payload, layer);
-}
 
-function deleteCallback(layer, msg) {
-  console.log(msg);
-  const featureId = msg.payload;
-  sses[layer.name].send({ id: featureId}, 'delete');
-}
 
-// Setup subscriptions to db notifications
+// Setup subscriptions to db notifications and initialize a ws
 for(const layer of layers) {
-  const sse = new SSE();
-  sses[layer.name] = sse;
-  pgRepo.subscribe(layer.updateEventName, msg => updateCallback(layer, msg));
-  pgRepo.subscribe(layer.deleteEventName, msg => deleteCallback(layer, msg));
+  layer.ws = new ConnectionManager();
+  pgRepo.subscribe(layer.updateEventName, (f) => wsHandler.sendUpdateToAll(layer, JSON.parse(f)));
+  pgRepo.subscribe(layer.deleteEventName, (fid) => wsHandler.sendDeleteToAll(layer, fid));
 }
 
-// Enable CORS whitelist. SSE does not accept wildcard origins
-// TODO: Move url:s to config file
-var whitelist = ['http://localhost:9966', 'http://localhost:9967']
+// Allow pretty much anyting CORS-wise. Some functions don't accept wildcard in CORS header so this returns actual origin.
 var corsOptions = {
   origin: function (origin, callback) {
-    if (whitelist.indexOf(origin) !== -1) {
       callback(null, true)
-    } else {
-      callback(new Error('Not allowed by CORS'))
-    }
   },
   credentials: true
 }
@@ -125,42 +125,22 @@ app.get(virtualPath + '/', function (req, res) {
   res.send(APP_NAME + ' is alive!');
 });
 
-/**
- * This is where the magic happen. Each request will open an SSE connection to
- * the layer specified in the query string
- * @param {*} req 
- * @param {*} res 
- * @param {*} next 
- * @returns 
- */
-async function handleSubscribe(req, res, next) {
-  const layerName = req.query.layer;
-  const sse = sses[layerName];
-  const layer = layers.find(l => l.name === layerName);
-  if (!sse) {
-    // EventSource can't handle repsonse codes, but we sent it anyway for easier debugging
-    res.status(400).send('Invalid layer name');
-    return;
-  }
-  sse.init(req, res);
+// "Route" for websocket connections. Express does not support routes for websockets
+// so we listen to WebSocketServer events. There is a package, express-ws, that makes
+// it possible to write routing style websockets routes, but I prefer to keep it raw
+// for control.
+wss.on('connection', wsHandler.wssStream({
+  layers,
+  wss,
+  pgRepo
 
-  // Send initial state. It is actually done asynchronously as 
-  // express-sse emits an event to itself.
-  if (layer.table) {
-    const features = await pgRepo.executeSql(`SELECT ST_AsGeoJson(t.*) as feature FROM ${layer.table} t`);
-    for (const row of features.rows) {
-      sendUpdate(row.feature, layer);
-    }
-  } else {
-    // Sends a comment to make connection not pending until data arrives
-    // Doesn't really matter but it looks better in the client
-    sse.send(':Imopen');
-  }
-  
-}
+}));
 
+// The (now defunct) SEE subscribe endpoint. Dead code in ./routers/ssestream.js
+// app.get(virtualPath + '/subscribe', handleSubscribe);
 
-app.get(virtualPath + '/subscribe', handleSubscribe);
+app.use(virtualPath + '/featuresapi', featureApiRouter(featuresApiOpts));
+
 
 // The error handler.
 app.use((err, req, res, next) => {
@@ -172,6 +152,6 @@ app.use((err, req, res, next) => {
   res.status(500).json(errObj);
 })
 
-app.listen(bindport, () => {
+server.listen(bindport, () => {
   console.log(`${APP_NAME} running on port ${bindport} on virtual path: ${virtualPath}`);
 })
